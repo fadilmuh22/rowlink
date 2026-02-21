@@ -1,0 +1,10 @@
+[package]
+name = "rowlink"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+enigo = { version = "0.6.1", features = ["wayland"] }
+iced = { version = "0.14", features = ["canvas", "tokio"] }
+iced_layershell = "0.15.0"
+tokio = { version = "1", features = ["signal"] }
