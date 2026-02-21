@@ -12,6 +12,58 @@ use iced_layershell::settings::{LayerShellSettings, Settings};
 use iced_layershell::{application, to_layer_message};
 use tokio::signal::unix::{SignalKind, signal};
 
+// --- Configurable Constants ---
+const SCREEN_W: f32 = 1920.0;
+const SCREEN_H: f32 = 1080.0;
+const MAIN_GRID_SIZE: f32 = 26.0;
+const SUB_ROWS: i32 = 3;
+const SUB_COLS: i32 = 8;
+const SUB_PADDING: f32 = 4.0;
+const FONT_SIZE: f32 = 11.0;
+
+// Math / Layout Constants
+const HALF: f32 = 2.0; // Divisor to find the exact center of a cell
+const DOUBLE: f32 = 2.0; // Multiplier to account for padding on both sides
+const BASE_CHAR: u32 = 'A' as u32;
+const BASE_BYTE: u8 = b'A';
+
+// Timings
+const DELAY_SURFACE_DESTROY_MS: u64 = 60;
+const DELAY_WAYLAND_ZERO_MS: u64 = 5;
+const DELAY_WAYLAND_MOVE_MS: u64 = 20;
+
+// Colors
+const COLOR_GRID_BORDER: Color = Color {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 0.15,
+};
+const COLOR_MAIN_TEXT: Color = Color {
+    r: 1.0,
+    g: 0.8,
+    b: 0.2,
+    a: 1.0,
+}; // Yellow
+const COLOR_SUB_HOME_ROW: Color = Color {
+    r: 0.0,
+    g: 1.0,
+    b: 0.5,
+    a: 1.0,
+}; // Vibrant Green
+const COLOR_SUB_DEFAULT: Color = Color {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 0.8,
+}; // Soft White
+
+const SUB_LABELS: [[&str; 8]; 3] = [
+    ["Q", "W", "E", "R", "U", "I", "O", "P"],
+    ["A", "S", "D", "F", "J", "K", "L", ";"],
+    ["Z", "X", "C", "V", "N", "M", ",", "."],
+];
+
 pub fn main() -> Result<(), iced_layershell::Error> {
     application(Rowlink::default, namespace, update, view)
         .subscription(subscription)
@@ -67,16 +119,74 @@ enum Message {
     IcedEvent(Event),
 }
 
-fn startup_worker() -> impl iced::futures::Stream<Item = Message> {
-    stream::channel(1, async |mut output| {
-        let _ = output.send(Message::Startup).await;
-    })
+// --- Helper Functions ---
+
+fn get_layer_settings(interactive: bool) -> NewLayerShellSettings {
+    if interactive {
+        NewLayerShellSettings {
+            size: None,
+            anchor: Anchor::all(),
+            layer: Layer::Overlay,
+            exclusive_zone: Some(-1),
+            events_transparent: true,
+            keyboard_interactivity: KeyboardInteractivity::OnDemand,
+            ..Default::default()
+        }
+    } else {
+        NewLayerShellSettings {
+            anchor: Anchor::all(),
+            layer: Layer::Background,
+            keyboard_interactivity: KeyboardInteractivity::None,
+            events_transparent: true,
+            ..Default::default()
+        }
+    }
 }
+
+fn map_key_to_subgrid(c: char) -> Option<(i32, i32)> {
+    match c.to_ascii_uppercase() {
+        'Q' => Some((0, 0)),
+        'W' => Some((0, 1)),
+        'E' => Some((0, 2)),
+        'R' => Some((0, 3)),
+        'U' => Some((0, 4)),
+        'I' => Some((0, 5)),
+        'O' => Some((0, 6)),
+        'P' => Some((0, 7)),
+        'A' => Some((1, 0)),
+        'S' => Some((1, 1)),
+        'D' => Some((1, 2)),
+        'F' => Some((1, 3)),
+        'J' => Some((1, 4)),
+        'K' => Some((1, 5)),
+        'L' => Some((1, 6)),
+        ';' => Some((1, 7)),
+        'Z' => Some((2, 0)),
+        'X' => Some((2, 1)),
+        'C' => Some((2, 2)),
+        'V' => Some((2, 3)),
+        'N' => Some((2, 4)),
+        'M' => Some((2, 5)),
+        ',' => Some((2, 6)),
+        '.' => Some((2, 7)),
+        _ => None,
+    }
+}
+
+fn perform_wayland_click(enigo: &mut Enigo, x: f32, y: f32) {
+    std::thread::sleep(std::time::Duration::from_millis(DELAY_SURFACE_DESTROY_MS));
+    let _ = enigo.move_mouse(-10000, -10000, Coordinate::Rel);
+    std::thread::sleep(std::time::Duration::from_millis(DELAY_WAYLAND_ZERO_MS));
+    let _ = enigo.move_mouse(x.round() as i32, y.round() as i32, Coordinate::Rel);
+    std::thread::sleep(std::time::Duration::from_millis(DELAY_WAYLAND_MOVE_MS));
+    let _ = enigo.button(Button::Left, Direction::Click);
+}
+
+// --- Subscription & Update ---
 
 fn signal_worker() -> impl iced::futures::Stream<Item = Message> {
     stream::channel(10, async |mut output| {
         let mut sig = signal(SignalKind::user_defined1()).expect("Failed to setup signal listener");
-
         loop {
             sig.recv().await;
             let _ = output.send(Message::SignalReceived).await;
@@ -86,15 +196,17 @@ fn signal_worker() -> impl iced::futures::Stream<Item = Message> {
 
 fn subscription(_state: &Rowlink) -> Subscription<Message> {
     Subscription::batch(vec![
-        Subscription::run(startup_worker),
         Subscription::run(signal_worker),
         iced::event::listen().map(Message::IcedEvent),
     ])
 }
 
-// --- Update & View ---
 fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
     match message {
+        Message::LayerChange { id, .. } | Message::NewLayerShell { id, .. } => {
+            state.current_id = Some(id);
+            iced::Task::none()
+        }
         Message::Startup => iced::Task::done(Message::SetInputRegion {
             id: state.current_id.unwrap_or(IcedId::unique()),
             callback: ActionCallback::new(|_region| {}),
@@ -102,246 +214,138 @@ fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
         Message::SignalReceived => {
             state.visible = true;
             state.input_buffer.clear();
-            let settings = NewLayerShellSettings {
-                size: None,
-                anchor: Anchor::all(),
-                layer: Layer::Overlay,
-                exclusive_zone: Some(-1),
-                events_transparent: true,
-                keyboard_interactivity: KeyboardInteractivity::OnDemand, // Grab keyboard!
-                ..Default::default()
-            };
 
-            let (new_id, spawn_task) = Message::layershell_open(settings);
+            let (new_id, spawn_task) = Message::layershell_open(get_layer_settings(true));
+            let old_id = state.current_id.replace(new_id).unwrap_or(IcedId::unique());
 
-            let old_id = state.current_id.unwrap_or(IcedId::unique());
-            state.current_id = Some(new_id);
             iced::Task::batch(vec![
                 iced::Task::done(Message::RemoveWindow(old_id)),
                 spawn_task,
             ])
         }
 
-        Message::IcedEvent(Event::Keyboard(keyboard::Event::KeyPressed { key, .. })) => {
-            println!("Key pressed: {:?}", key);
-            match key {
-                // ESCAPE Logic: Close the overlay
-                keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                    state.visible = false;
-                    state.input_buffer.clear();
+        Message::IcedEvent(Event::Keyboard(keyboard::Event::KeyPressed { key, .. })) => match key {
+            keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                state.visible = false;
+                state.input_buffer.clear();
 
-                    let settings = NewLayerShellSettings {
-                        anchor: Anchor::all(),
-                        layer: Layer::Background,
-                        keyboard_interactivity: KeyboardInteractivity::None,
-                        events_transparent: true,
-                        ..Default::default()
-                    };
+                let (new_id, spawn_task) = Message::layershell_open(get_layer_settings(false));
+                let old_id = state.current_id.replace(new_id).unwrap();
 
-                    let (new_id, spawn_task) = Message::layershell_open(settings);
-                    let old_id = state.current_id.unwrap();
-                    state.current_id = Some(new_id);
+                iced::Task::batch(vec![
+                    iced::Task::done(Message::RemoveWindow(old_id)),
+                    spawn_task,
+                ])
+            }
+            keyboard::Key::Named(keyboard::key::Named::Space) => {
+                let target_cell = state.zoomed_cell;
+                state.visible = false;
+                state.input_buffer.clear();
+                state.zoomed_cell = None;
+                state.grid_cache.clear();
 
-                    iced::Task::batch(vec![
-                        iced::Task::done(Message::RemoveWindow(old_id)),
-                        spawn_task,
-                    ])
-                }
-                keyboard::Key::Character(c) => {
-                    let c_char = c.chars().next().unwrap().to_ascii_uppercase();
+                let (new_id, spawn_task) = Message::layershell_open(get_layer_settings(false));
+                let old_id = state.current_id.replace(new_id).unwrap();
 
-                    if state.zoomed_cell.is_none() {
-                        if c_char.is_ascii_uppercase() {
-                            state.input_buffer.push(c_char);
-                        }
+                iced::Task::batch(vec![
+                    iced::Task::done(Message::RemoveWindow(old_id)),
+                    iced::Task::done(Message::ExecuteMoveCenter(target_cell)),
+                    spawn_task,
+                ])
+            }
+            keyboard::Key::Character(c) => {
+                let c_char = c.chars().next().unwrap();
 
-                        if state.input_buffer.len() >= 2 {
-                            let chars: Vec<char> = state.input_buffer.chars().collect();
-                            let row = (chars[0] as u32 - 'A' as u32) as i32;
-                            let col = (chars[1] as u32 - 'A' as u32) as i32;
+                if state.zoomed_cell.is_none() {
+                    let c_upper = c_char.to_ascii_uppercase();
+                    if c_upper.is_ascii_uppercase() {
+                        state.input_buffer.push(c_upper);
+                    }
 
-                            state.zoomed_cell = Some((row, col));
-                            state.input_buffer.clear();
-                            state.grid_cache.clear();
-                        }
+                    if state.input_buffer.len() >= 2 {
+                        let chars: Vec<char> = state.input_buffer.chars().collect();
+                        state.zoomed_cell = Some((
+                            (chars[0] as u32 - BASE_CHAR) as i32,
+                            (chars[1] as u32 - BASE_CHAR) as i32,
+                        ));
+                        state.input_buffer.clear();
+                        state.grid_cache.clear();
+                    }
+                    iced::Task::none()
+                } else {
+                    if let Some((sub_row, sub_col)) = map_key_to_subgrid(c_char) {
+                        let (main_row, main_col) = state.zoomed_cell.unwrap();
+
+                        state.visible = false;
+                        state.input_buffer.clear();
+                        state.zoomed_cell = None;
+                        state.grid_cache.clear();
+
+                        let (new_id, spawn_task) =
+                            Message::layershell_open(get_layer_settings(false));
+                        let old_id = state.current_id.replace(new_id).unwrap();
+
+                        iced::Task::batch(vec![
+                            iced::Task::done(Message::RemoveWindow(old_id)),
+                            iced::Task::done(Message::ExecuteMovePrecision(
+                                main_row, main_col, sub_row, sub_col,
+                            )),
+                            spawn_task,
+                        ])
+                    } else {
                         iced::Task::none()
                     }
-                    // Step 2: Handle 8x3 Precision Zoom
-                    else {
-                        // Map the physical key to (sub_row, sub_col)
-                        let sub_coords = match c.as_str() {
-                            // Row 1
-                            "q" | "Q" => Some((0, 0)),
-                            "w" | "W" => Some((0, 1)),
-                            "e" | "E" => Some((0, 2)),
-                            "r" | "R" => Some((0, 3)),
-                            "u" | "U" => Some((0, 4)),
-                            "i" | "I" => Some((0, 5)),
-                            "o" | "O" => Some((0, 6)),
-                            "p" | "P" => Some((0, 7)),
-                            // Row 2
-                            "a" | "A" => Some((1, 0)),
-                            "s" | "S" => Some((1, 1)),
-                            "d" | "D" => Some((1, 2)),
-                            "f" | "F" => Some((1, 3)),
-                            "j" | "J" => Some((1, 4)),
-                            "k" | "K" => Some((1, 5)),
-                            "l" | "L" => Some((1, 6)),
-                            ";" => Some((1, 7)),
-                            // Row 3
-                            "z" | "Z" => Some((2, 0)),
-                            "x" | "X" => Some((2, 1)),
-                            "c" | "C" => Some((2, 2)),
-                            "v" | "V" => Some((2, 3)),
-                            "n" | "N" => Some((2, 4)),
-                            "m" | "M" => Some((2, 5)),
-                            "," => Some((2, 6)),
-                            "." => Some((2, 7)),
-                            _ => None,
-                        };
-
-                        if let Some((sub_row, sub_col)) = sub_coords {
-                            let (main_row, main_col) = state.zoomed_cell.unwrap();
-
-                            // Reset state
-                            state.visible = false;
-                            state.input_buffer.clear();
-                            state.zoomed_cell = None;
-                            state.grid_cache.clear();
-
-                            // Prepare Ghost Window settings
-                            let settings = NewLayerShellSettings {
-                                anchor: Anchor::all(),
-                                layer: Layer::Background,
-                                keyboard_interactivity: KeyboardInteractivity::None,
-                                events_transparent: true,
-                                ..Default::default()
-                            };
-
-                            let (new_id, spawn_task) = Message::layershell_open(settings);
-                            let old_id = state.current_id.unwrap();
-                            state.current_id = Some(new_id);
-
-                            iced::Task::batch(vec![
-                                iced::Task::done(Message::RemoveWindow(old_id)),
-                                iced::Task::done(Message::ExecuteMovePrecision(
-                                    main_row, main_col, sub_row, sub_col,
-                                )),
-                                spawn_task,
-                            ])
-                        } else {
-                            iced::Task::none()
-                        }
-                    }
                 }
-                keyboard::Key::Named(keyboard::key::Named::Space) => {
-                    // Grab the currently zoomed cell (could be None or Some((row, col)))
-                    let target_cell = state.zoomed_cell;
-
-                    // Reset all state
-                    state.visible = false;
-                    state.input_buffer.clear();
-                    state.zoomed_cell = None;
-                    state.grid_cache.clear();
-
-                    // Swap back to the GHOST window BEFORE clicking
-                    let settings = NewLayerShellSettings {
-                        anchor: Anchor::all(),
-                        layer: Layer::Background,
-                        keyboard_interactivity: KeyboardInteractivity::None,
-                        events_transparent: true,
-                        ..Default::default()
-                    };
-
-                    let (new_id, spawn_task) = Message::layershell_open(settings);
-                    let old_id = state.current_id.unwrap();
-                    state.current_id = Some(new_id);
-
-                    return iced::Task::batch(vec![
-                        iced::Task::done(Message::RemoveWindow(old_id)),
-                        iced::Task::done(Message::ExecuteMoveCenter(target_cell)),
-                        spawn_task,
-                    ]);
-                }
-                _ => iced::Task::none(),
             }
-        }
+            _ => iced::Task::none(),
+        },
 
         Message::ExecuteMovePrecision(main_row, main_col, sub_row, sub_col) => {
-            let screen_w = 1920.0;
-            let screen_h = 1080.0;
+            let cell_w = SCREEN_W / MAIN_GRID_SIZE;
+            let cell_h = SCREEN_H / MAIN_GRID_SIZE;
 
-            let cell_w = screen_w / 26.0;
-            let cell_h = screen_h / 26.0;
-
-            // Main Cell Start Coordinates
             let main_x = main_col as f32 * cell_w;
             let main_y = main_row as f32 * cell_h;
 
-            let padding = 4.0;
-            let sub_container_w = cell_w - (padding * 2.0);
-            let sub_container_h = cell_h - (padding * 2.0);
+            let sub_container_w = cell_w - (SUB_PADDING * DOUBLE);
+            let sub_container_h = cell_h - (SUB_PADDING * DOUBLE);
 
-            // Sub Cell Dimensions for 8 columns x 3 rows
-            let sub_w = sub_container_w / 8.0;
-            let sub_h = sub_container_h / 3.0;
+            let sub_w = sub_container_w / SUB_COLS as f32;
+            let sub_h = sub_container_h / SUB_ROWS as f32;
 
-            // Center of the target sub-cell
-            let target_x = main_x + (sub_col as f32 * sub_w) + (sub_w / 2.0);
-            let target_y = main_y + (sub_row as f32 * sub_h) + (sub_h / 2.0);
+            let target_x = main_x + SUB_PADDING + (sub_col as f32 * sub_w) + (sub_w / HALF);
+            let target_y = main_y + SUB_PADDING + (sub_row as f32 * sub_h) + (sub_h / HALF);
 
-            let final_x = target_x.round() as i32;
-            let final_y = target_y.round() as i32;
-
-            // Zero out and move (Enigo Hack)
-            let _ = state.enigo.move_mouse(-10000, -10000, Coordinate::Rel);
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            let _ = state.enigo.move_mouse(final_x, final_y, Coordinate::Rel);
-            std::thread::sleep(std::time::Duration::from_millis(15));
-            let _ = state.enigo.button(Button::Left, Direction::Click);
-
+            perform_wayland_click(&mut state.enigo, target_x, target_y);
             iced::Task::none()
         }
-        Message::ExecuteMoveCenter(target_cell) => {
-            let screen_w = 1920.0;
-            let screen_h = 1080.0;
 
+        Message::ExecuteMoveCenter(target_cell) => {
             let (target_x, target_y) = match target_cell {
                 Some((r, c)) => {
-                    let cell_w = screen_w / 26.0;
-                    let cell_h = screen_h / 26.0;
+                    let cell_w = SCREEN_W / MAIN_GRID_SIZE;
+                    let cell_h = SCREEN_H / MAIN_GRID_SIZE;
                     (
-                        (c as f32 * cell_w) + (cell_w / 2.0),
-                        (r as f32 * cell_h) + (cell_h / 2.0),
+                        (c as f32 * cell_w) + (cell_w / HALF),
+                        (r as f32 * cell_h) + (cell_h / HALF),
                     )
                 }
-                None => (screen_w / 2.0, screen_h / 2.0),
+                None => (SCREEN_W / HALF, SCREEN_H / HALF),
             };
 
-            // --- CRITICAL: Wait for window to vanish ---
-            std::thread::sleep(std::time::Duration::from_millis(60));
-
-            let _ = state.enigo.move_mouse(-10000, -10000, Coordinate::Rel);
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            let _ = state.enigo.move_mouse(
-                target_x.round() as i32,
-                target_y.round() as i32,
-                Coordinate::Rel,
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            let _ = state.enigo.button(Button::Left, Direction::Click);
-
+            perform_wayland_click(&mut state.enigo, target_x, target_y);
             iced::Task::none()
         }
         _ => iced::Task::none(),
     }
 }
 
+// --- View & Style ---
+
 fn view(state: &Rowlink) -> Element<Message> {
     if !state.visible {
         return iced::widget::container(iced::widget::space()).into();
     }
-
     Canvas::new(state).width(Fill).height(Fill).into()
 }
 
@@ -366,12 +370,11 @@ impl<Message> canvas::Program<Message> for Rowlink {
         _cursor: iced::mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let grid = self.grid_cache.draw(renderer, bounds.size(), |frame| {
-            let cell_width = bounds.width / 26.0;
-            let cell_height = bounds.height / 26.0;
+            let cell_width = bounds.width / MAIN_GRID_SIZE;
+            let cell_height = bounds.height / MAIN_GRID_SIZE;
 
-            // Define the border style
             let border_stroke = canvas::Stroke {
-                style: Style::Solid(Color::from_rgba(1.0, 1.0, 1.0, 0.15)),
+                style: Style::Solid(COLOR_GRID_BORDER),
                 width: 1.0,
                 ..Default::default()
             };
@@ -380,41 +383,28 @@ impl<Message> canvas::Program<Message> for Rowlink {
                 let main_x = zoom_c as f32 * cell_width;
                 let main_y = zoom_r as f32 * cell_height;
 
-                // Padding ensures the subgrid feels "nested" and neat
-                let padding = 4.0;
-                let sub_container_w = cell_width - (padding * 2.0);
-                let sub_container_h = cell_height - (padding * 2.0);
+                let sub_container_w = cell_width - (SUB_PADDING * DOUBLE);
+                let sub_container_h = cell_height - (SUB_PADDING * DOUBLE);
 
-                // We removed the frame.fill_rectangle to keep it 100% transparent.
-                // If you find it hard to see, you can add a tiny glow/border instead.
+                let sub_w = sub_container_w / SUB_COLS as f32;
+                let sub_h = sub_container_h / SUB_ROWS as f32;
 
-                let sub_w = sub_container_w / 8.0;
-                let sub_h = sub_container_h / 3.0;
+                for r in 0..SUB_ROWS {
+                    for c in 0..SUB_COLS {
+                        let x = main_x + SUB_PADDING + (c as f32 * sub_w);
+                        let y = main_y + SUB_PADDING + (r as f32 * sub_h);
 
-                let labels = [
-                    ["Q", "W", "E", "R", "U", "I", "O", "P"],
-                    ["A", "S", "D", "F", "J", "K", "L", ";"],
-                    ["Z", "X", "C", "V", "N", "M", ",", "."],
-                ];
-
-                for r in 0..3 {
-                    for c in 0..8 {
-                        let x = main_x + padding + (c as f32 * sub_w);
-                        let y = main_y + padding + (r as f32 * sub_h);
-
-                        // Use high contrast for transparent backgrounds
                         let text_color = if r == 1 {
-                            Color::from_rgb(0.0, 1.0, 0.5) // Vibrant Green for Home Row
+                            COLOR_SUB_HOME_ROW
                         } else {
-                            Color::from_rgba(1.0, 1.0, 1.0, 0.8) // Soft White for others
+                            COLOR_SUB_DEFAULT
                         };
 
-                        // Draw Sub-Cell Text
                         frame.fill_text(Text {
-                            content: labels[r][c].to_string(),
-                            position: Point::new(x + sub_w / 2.0, y + sub_h / 2.0),
+                            content: SUB_LABELS[r as usize][c as usize].to_string(),
+                            position: Point::new(x + sub_w / HALF, y + sub_h / HALF),
                             color: text_color,
-                            size: 11.0.into(),
+                            size: FONT_SIZE.into(),
                             align_x: iced::widget::text::Alignment::Center,
                             align_y: iced::alignment::Vertical::Center,
                             font: Font::MONOSPACE,
@@ -423,9 +413,8 @@ impl<Message> canvas::Program<Message> for Rowlink {
                     }
                 }
             } else {
-                // --- DRAW MAIN 26x26 GRID ---
-                for r in 0..26 {
-                    for c in 0..26 {
+                for r in 0..MAIN_GRID_SIZE as i32 {
+                    for c in 0..MAIN_GRID_SIZE as i32 {
                         let x = c as f32 * cell_width;
                         let y = r as f32 * cell_height;
 
@@ -440,12 +429,12 @@ impl<Message> canvas::Program<Message> for Rowlink {
                         frame.fill_text(Text {
                             content: format!(
                                 "{}{}",
-                                (b'A' + r as u8) as char,
-                                (b'A' + c as u8) as char
+                                (BASE_BYTE + r as u8) as char,
+                                (BASE_BYTE + c as u8) as char
                             ),
-                            position: Point::new(x + cell_width / 2.0, y + cell_height / 2.0),
-                            color: Color::from_rgb(1.0, 0.8, 0.2), // Yellow
-                            size: 11.0.into(),
+                            position: Point::new(x + cell_width / HALF, y + cell_height / HALF),
+                            color: COLOR_MAIN_TEXT,
+                            size: FONT_SIZE.into(),
                             align_x: iced::widget::text::Alignment::Center,
                             align_y: iced::alignment::Vertical::Center,
                             font: Font::MONOSPACE,
