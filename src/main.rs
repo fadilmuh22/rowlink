@@ -89,7 +89,6 @@ fn namespace() -> String {
 
 struct Rowlink {
     input_buffer: String,
-    enigo: Enigo,
     visible: bool,
     grid_cache: canvas::Cache,
     current_id: Option<IcedId>,
@@ -100,7 +99,6 @@ impl Default for Rowlink {
     fn default() -> Self {
         Self {
             input_buffer: String::new(),
-            enigo: Enigo::new(&EnigoSettings::default()).expect("Enigo init failed"),
             visible: false,
             grid_cache: canvas::Cache::default(),
             current_id: None,
@@ -173,7 +171,12 @@ fn map_key_to_subgrid(c: char) -> Option<(i32, i32)> {
     }
 }
 
-fn perform_wayland_click(enigo: &mut Enigo, x: f32, y: f32) {
+fn perform_wayland_click(x: f32, y: f32) {
+    let mut enigo = Enigo::new(&EnigoSettings::default()).unwrap_or_else(|e| {
+        eprintln!("Failed to init Enigo: {}", e);
+        panic!("Input system failed");
+    });
+
     std::thread::sleep(std::time::Duration::from_millis(DELAY_SURFACE_DESTROY_MS));
     let _ = enigo.move_mouse(-10000, -10000, Coordinate::Rel);
     std::thread::sleep(std::time::Duration::from_millis(DELAY_WAYLAND_ZERO_MS));
@@ -316,7 +319,7 @@ fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
             let target_x = main_x + SUB_PADDING + (sub_col as f32 * sub_w) + (sub_w / HALF);
             let target_y = main_y + SUB_PADDING + (sub_row as f32 * sub_h) + (sub_h / HALF);
 
-            perform_wayland_click(&mut state.enigo, target_x, target_y);
+            perform_wayland_click(target_x, target_y);
             iced::Task::none()
         }
 
@@ -333,7 +336,7 @@ fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
                 None => (SCREEN_W / HALF, SCREEN_H / HALF),
             };
 
-            perform_wayland_click(&mut state.enigo, target_x, target_y);
+            perform_wayland_click(target_x, target_y);
             iced::Task::none()
         }
         _ => iced::Task::none(),
