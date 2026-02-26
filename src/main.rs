@@ -48,6 +48,7 @@ struct AppConfig {
     delay_surface_destroy_ms: u64,
     delay_wayland_zero_ms: u64,
     delay_wayland_move_ms: u64,
+    delay_double_click_ms: u64,
     // Colors
     color_grid_border: ConfigColor,
     color_main_text: ConfigColor,
@@ -73,6 +74,7 @@ impl Default for AppConfig {
             delay_surface_destroy_ms: 60,
             delay_wayland_zero_ms: 5,
             delay_wayland_move_ms: 20,
+            delay_double_click_ms: 120,
             color_grid_border: ConfigColor {
                 r: 1.0,
                 g: 1.0,
@@ -201,8 +203,8 @@ impl Default for Rowlink {
 enum Message {
     Startup,
     SignalReceived,
-    ExecuteMovePrecision(i32, i32, i32, i32),
-    ExecuteMoveCenter(Option<(i32, i32)>),
+    ExecuteMovePrecision(i32, i32, i32, i32, bool),
+    ExecuteMoveCenter(Option<(i32, i32)>, bool),
     IcedEvent(Event),
 }
 
@@ -241,7 +243,7 @@ fn map_key_to_subgrid(c: char) -> Option<(i32, i32)> {
     None
 }
 
-fn perform_wayland_click(x: f32, y: f32) {
+fn perform_wayland_click(x: f32, y: f32, is_double: bool) {
     let mut enigo = match Enigo::new(&EnigoSettings::default()) {
         Ok(e) => e,
         Err(e) => {
@@ -261,7 +263,14 @@ fn perform_wayland_click(x: f32, y: f32) {
     std::thread::sleep(std::time::Duration::from_millis(
         cfg().delay_wayland_move_ms,
     ));
+
     let _ = enigo.button(Button::Left, Direction::Click);
+    if is_double {
+        std::thread::sleep(std::time::Duration::from_millis(
+            cfg().delay_double_click_ms,
+        ));
+        let _ = enigo.button(Button::Left, Direction::Click);
+    }
 }
 
 // --- Subscription & Update ---
@@ -303,20 +312,20 @@ fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
                 spawn_task,
             ])
         }
-        Message::IcedEvent(Event::Keyboard(keyboard::Event::KeyPressed { key, .. })) => {
+        Message::IcedEvent(Event::Keyboard(keyboard::Event::KeyPressed {
+            key, modifiers, ..
+        })) => {
             match key {
                 keyboard::Key::Named(keyboard::key::Named::Escape) => {
                     if !state.input_buffer.is_empty() {
                         state.input_buffer.pop();
                         state.grid_cache.clear();
                         iced::Task::none()
-                    }
-                    else if state.zoomed_cell.is_some() {
+                    } else if state.zoomed_cell.is_some() {
                         state.zoomed_cell = None;
                         state.grid_cache.clear();
                         iced::Task::none()
-                    }
-                    else {
+                    } else {
                         state.visible = false;
                         state.input_buffer.clear();
 
@@ -332,6 +341,8 @@ fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
                 }
                 keyboard::Key::Named(keyboard::key::Named::Space) => {
                     let target_cell = state.zoomed_cell;
+                    let is_double = modifiers.shift();
+
                     state.visible = false;
                     state.input_buffer.clear();
                     state.zoomed_cell = None;
@@ -340,7 +351,7 @@ fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
                     let old_id = state.current_id.replace(new_id).unwrap();
                     iced::Task::batch(vec![
                         iced::Task::done(Message::RemoveWindow(old_id)),
-                        iced::Task::done(Message::ExecuteMoveCenter(target_cell)),
+                        iced::Task::done(Message::ExecuteMoveCenter(target_cell, is_double)),
                         spawn_task,
                     ])
                 }
@@ -355,16 +366,36 @@ fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
                         }
                         if state.input_buffer.len() >= 2 {
                             let chars: Vec<char> = state.input_buffer.chars().collect();
-                            state.zoomed_cell = Some((
-                                (chars[0] as u32 - BASE_CHAR) as i32,
-                                (chars[1] as u32 - BASE_CHAR) as i32,
-                            ));
+                            let row = (chars[0] as u32 - BASE_CHAR) as i32;
+                            let col = (chars[1] as u32 - BASE_CHAR) as i32;
+
+                            if modifiers.shift() {
+                                state.visible = false;
+                                state.input_buffer.clear();
+                                state.grid_cache.clear();
+                                let (new_id, spawn_task) =
+                                    Message::layershell_open(get_layer_settings(false));
+                                let old_id = state.current_id.replace(new_id).unwrap();
+
+                                return iced::Task::batch(vec![
+                                    iced::Task::done(Message::RemoveWindow(old_id)),
+                                    iced::Task::done(Message::ExecuteMoveCenter(
+                                        Some((row, col)),
+                                        true,
+                                    )), // Double click
+                                    spawn_task,
+                                ]);
+                            }
+
+                            state.zoomed_cell = Some((row, col));
                             state.input_buffer.clear();
                             state.grid_cache.clear();
                         }
                         iced::Task::none()
                     } else if let Some((sub_row, sub_col)) = map_key_to_subgrid(c_char) {
                         let (main_row, main_col) = state.zoomed_cell.unwrap();
+                        let is_double = modifiers.shift();
+
                         state.visible = false;
                         state.input_buffer.clear();
                         state.zoomed_cell = None;
@@ -375,7 +406,7 @@ fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
                         iced::Task::batch(vec![
                             iced::Task::done(Message::RemoveWindow(old_id)),
                             iced::Task::done(Message::ExecuteMovePrecision(
-                                main_row, main_col, sub_row, sub_col,
+                                main_row, main_col, sub_row, sub_col, is_double,
                             )),
                             spawn_task,
                         ])
@@ -386,7 +417,7 @@ fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
                 _ => iced::Task::none(),
             }
         }
-        Message::ExecuteMovePrecision(main_row, main_col, sub_row, sub_col) => {
+        Message::ExecuteMovePrecision(main_row, main_col, sub_row, sub_col, is_double) => {
             let cell_w = cfg().screen_width / cfg().main_grid_size;
             let cell_h = cfg().screen_height / cfg().main_grid_size;
             let main_x = main_col as f32 * cell_w;
@@ -397,10 +428,10 @@ fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
             let sub_h = sub_container_h / cfg().sub_rows as f32;
             let target_x = main_x + cfg().sub_padding + (sub_col as f32 * sub_w) + (sub_w / HALF);
             let target_y = main_y + cfg().sub_padding + (sub_row as f32 * sub_h) + (sub_h / HALF);
-            perform_wayland_click(target_x, target_y);
+            perform_wayland_click(target_x, target_y, is_double);
             iced::Task::none()
         }
-        Message::ExecuteMoveCenter(target_cell) => {
+        Message::ExecuteMoveCenter(target_cell, is_double) => {
             let (target_x, target_y) = match target_cell {
                 Some((r, c)) => {
                     let cell_w = cfg().screen_width / cfg().main_grid_size;
@@ -412,7 +443,7 @@ fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
                 }
                 None => (cfg().screen_width / HALF, cfg().screen_height / HALF),
             };
-            perform_wayland_click(target_x, target_y);
+            perform_wayland_click(target_x, target_y, is_double);
             iced::Task::none()
         }
         _ => iced::Task::none(),
