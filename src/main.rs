@@ -19,11 +19,21 @@ static CONFIG: OnceLock<AppConfig> = OnceLock::new();
 
 #[derive(Debug, Deserialize, Clone, Copy)]
 struct ConfigColor {
-    r: f32, g: f32, b: f32, a: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
 }
 
 impl ConfigColor {
-    fn to_iced(self) -> Color { Color { r: self.r, g: self.g, b: self.b, a: self.a } }
+    fn to_iced(self) -> Color {
+        Color {
+            r: self.r,
+            g: self.g,
+            b: self.b,
+            a: self.a,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -43,8 +53,11 @@ struct AppConfig {
     color_main_text: ConfigColor,
     color_sub_home_row: ConfigColor,
     color_sub_default: ConfigColor,
+    color_row_highlight: ConfigColor,
+    color_text_dimmed: ConfigColor,
+    color_border_dimmed: ConfigColor,
     // Labels (Dynamic 2D Grid)
-    sub_labels: Vec<String>, 
+    sub_labels: Vec<String>,
 }
 
 impl Default for AppConfig {
@@ -60,10 +73,48 @@ impl Default for AppConfig {
             delay_surface_destroy_ms: 60,
             delay_wayland_zero_ms: 5,
             delay_wayland_move_ms: 20,
-            color_grid_border: ConfigColor { r: 1.0, g: 1.0, b: 1.0, a: 0.15 },
-            color_main_text: ConfigColor { r: 1.0, g: 0.8, b: 0.2, a: 1.0 },
-            color_sub_home_row: ConfigColor { r: 0.0, g: 1.0, b: 0.5, a: 1.0 },
-            color_sub_default: ConfigColor { r: 1.0, g: 1.0, b: 1.0, a: 0.8 },
+            color_grid_border: ConfigColor {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.15,
+            },
+            color_main_text: ConfigColor {
+                r: 1.0,
+                g: 0.8,
+                b: 0.2,
+                a: 1.0,
+            },
+            color_sub_home_row: ConfigColor {
+                r: 0.0,
+                g: 1.0,
+                b: 0.5,
+                a: 1.0,
+            },
+            color_sub_default: ConfigColor {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.8,
+            },
+            color_row_highlight: ConfigColor {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.1,
+            },
+            color_text_dimmed: ConfigColor {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.05,
+            },
+            color_border_dimmed: ConfigColor {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.02,
+            },
             // Default QWERTY 8x3
             sub_labels: vec![
                 "QWERUIOP".to_string(),
@@ -97,7 +148,9 @@ fn load_config() -> AppConfig {
     AppConfig::default()
 }
 
-fn cfg() -> &'static AppConfig { CONFIG.get_or_init(load_config) }
+fn cfg() -> &'static AppConfig {
+    CONFIG.get_or_init(load_config)
+}
 
 pub fn main() -> Result<(), iced_layershell::Error> {
     let _ = cfg();
@@ -119,7 +172,9 @@ pub fn main() -> Result<(), iced_layershell::Error> {
         .run()
 }
 
-fn namespace() -> String { String::from("rowlink") }
+fn namespace() -> String {
+    String::from("rowlink")
+}
 
 struct Rowlink {
     input_buffer: String,
@@ -173,11 +228,9 @@ fn get_layer_settings(interactive: bool) -> NewLayerShellSettings {
     }
 }
 
-// --- Dynamic Input Mapping ---
-// Scans the configured `sub_labels` to find which coordinate matches the key pressed.
 fn map_key_to_subgrid(c: char) -> Option<(i32, i32)> {
     let input_char = c.to_ascii_uppercase();
-    
+
     for (r_idx, row_str) in cfg().sub_labels.iter().enumerate() {
         for (c_idx, key_char) in row_str.chars().enumerate() {
             if key_char.to_ascii_uppercase() == input_char {
@@ -197,11 +250,17 @@ fn perform_wayland_click(x: f32, y: f32) {
         }
     };
 
-    std::thread::sleep(std::time::Duration::from_millis(cfg().delay_surface_destroy_ms));
+    std::thread::sleep(std::time::Duration::from_millis(
+        cfg().delay_surface_destroy_ms,
+    ));
     let _ = enigo.move_mouse(-10000, -10000, Coordinate::Rel);
-    std::thread::sleep(std::time::Duration::from_millis(cfg().delay_wayland_zero_ms));
+    std::thread::sleep(std::time::Duration::from_millis(
+        cfg().delay_wayland_zero_ms,
+    ));
     let _ = enigo.move_mouse(x.round() as i32, y.round() as i32, Coordinate::Rel);
-    std::thread::sleep(std::time::Duration::from_millis(cfg().delay_wayland_move_ms));
+    std::thread::sleep(std::time::Duration::from_millis(
+        cfg().delay_wayland_move_ms,
+    ));
     let _ = enigo.button(Button::Left, Direction::Click);
 }
 
@@ -239,18 +298,37 @@ fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
             state.input_buffer.clear();
             let (new_id, spawn_task) = Message::layershell_open(get_layer_settings(true));
             let old_id = state.current_id.replace(new_id).unwrap_or(IcedId::unique());
-            iced::Task::batch(vec![iced::Task::done(Message::RemoveWindow(old_id)), spawn_task])
+            iced::Task::batch(vec![
+                iced::Task::done(Message::RemoveWindow(old_id)),
+                spawn_task,
+            ])
         }
         Message::IcedEvent(Event::Keyboard(keyboard::Event::KeyPressed { key, .. })) => {
             match key {
                 keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                    state.visible = false;
-                    state.input_buffer.clear();
-                    state.zoomed_cell = None;
-                    state.grid_cache.clear();
-                    let (new_id, spawn_task) = Message::layershell_open(get_layer_settings(false));
-                    let old_id = state.current_id.replace(new_id).unwrap();
-                    iced::Task::batch(vec![iced::Task::done(Message::RemoveWindow(old_id)), spawn_task])
+                    if !state.input_buffer.is_empty() {
+                        state.input_buffer.pop();
+                        state.grid_cache.clear();
+                        iced::Task::none()
+                    }
+                    else if state.zoomed_cell.is_some() {
+                        state.zoomed_cell = None;
+                        state.grid_cache.clear();
+                        iced::Task::none()
+                    }
+                    else {
+                        state.visible = false;
+                        state.input_buffer.clear();
+
+                        let (new_id, spawn_task) =
+                            Message::layershell_open(get_layer_settings(false));
+                        let old_id = state.current_id.replace(new_id).unwrap();
+
+                        iced::Task::batch(vec![
+                            iced::Task::done(Message::RemoveWindow(old_id)),
+                            spawn_task,
+                        ])
+                    }
                 }
                 keyboard::Key::Named(keyboard::key::Named::Space) => {
                     let target_cell = state.zoomed_cell;
@@ -272,6 +350,8 @@ fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
                         let c_upper = c_char.to_ascii_uppercase();
                         if c_upper.is_ascii_uppercase() {
                             state.input_buffer.push(c_upper);
+                            // Clear cache to trigger redraw for row highlight
+                            state.grid_cache.clear();
                         }
                         if state.input_buffer.len() >= 2 {
                             let chars: Vec<char> = state.input_buffer.chars().collect();
@@ -283,24 +363,24 @@ fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
                             state.grid_cache.clear();
                         }
                         iced::Task::none()
+                    } else if let Some((sub_row, sub_col)) = map_key_to_subgrid(c_char) {
+                        let (main_row, main_col) = state.zoomed_cell.unwrap();
+                        state.visible = false;
+                        state.input_buffer.clear();
+                        state.zoomed_cell = None;
+                        state.grid_cache.clear();
+                        let (new_id, spawn_task) =
+                            Message::layershell_open(get_layer_settings(false));
+                        let old_id = state.current_id.replace(new_id).unwrap();
+                        iced::Task::batch(vec![
+                            iced::Task::done(Message::RemoveWindow(old_id)),
+                            iced::Task::done(Message::ExecuteMovePrecision(
+                                main_row, main_col, sub_row, sub_col,
+                            )),
+                            spawn_task,
+                        ])
                     } else {
-                        // Use Dynamic Mapping here
-                        if let Some((sub_row, sub_col)) = map_key_to_subgrid(c_char) {
-                            let (main_row, main_col) = state.zoomed_cell.unwrap();
-                            state.visible = false;
-                            state.input_buffer.clear();
-                            state.zoomed_cell = None;
-                            state.grid_cache.clear();
-                            let (new_id, spawn_task) = Message::layershell_open(get_layer_settings(false));
-                            let old_id = state.current_id.replace(new_id).unwrap();
-                            iced::Task::batch(vec![
-                                iced::Task::done(Message::RemoveWindow(old_id)),
-                                iced::Task::done(Message::ExecuteMovePrecision(main_row, main_col, sub_row, sub_col)),
-                                spawn_task,
-                            ])
-                        } else {
-                            iced::Task::none()
-                        }
+                        iced::Task::none()
                     }
                 }
                 _ => iced::Task::none(),
@@ -325,7 +405,10 @@ fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
                 Some((r, c)) => {
                     let cell_w = cfg().screen_width / cfg().main_grid_size;
                     let cell_h = cfg().screen_height / cfg().main_grid_size;
-                    ((c as f32 * cell_w) + (cell_w / HALF), (r as f32 * cell_h) + (cell_h / HALF))
+                    (
+                        (c as f32 * cell_w) + (cell_w / HALF),
+                        (r as f32 * cell_h) + (cell_h / HALF),
+                    )
                 }
                 None => (cfg().screen_width / HALF, cfg().screen_height / HALF),
             };
@@ -339,12 +422,17 @@ fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
 // --- View & Style ---
 
 fn view(state: &Rowlink) -> Element<Message> {
-    if !state.visible { return iced::widget::container(iced::widget::space()).into(); }
+    if !state.visible {
+        return iced::widget::container(iced::widget::space()).into();
+    }
     Canvas::new(state).width(Fill).height(Fill).into()
 }
 
 fn style(_state: &Rowlink, _theme: &Theme) -> iced::theme::Style {
-    iced::theme::Style { background_color: Color::TRANSPARENT, text_color: Color::WHITE }
+    iced::theme::Style {
+        background_color: Color::TRANSPARENT,
+        text_color: Color::WHITE,
+    }
 }
 
 // --- Canvas Program ---
@@ -352,12 +440,25 @@ fn style(_state: &Rowlink, _theme: &Theme) -> iced::theme::Style {
 impl<Message> canvas::Program<Message> for Rowlink {
     type State = ();
 
-    fn draw(&self, _state: &Self::State, renderer: &Renderer, _theme: &Theme, bounds: Rectangle, _cursor: iced::mouse::Cursor) -> Vec<canvas::Geometry> {
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
         let grid = self.grid_cache.draw(renderer, bounds.size(), |frame| {
             let cell_width = bounds.width / cfg().main_grid_size;
             let cell_height = bounds.height / cfg().main_grid_size;
-            let border_stroke = canvas::Stroke {
+            let stroke_normal = canvas::Stroke {
                 style: Style::Solid(cfg().color_grid_border.to_iced()),
+                width: 1.0,
+                ..Default::default()
+            };
+
+            let stroke_dimmed = canvas::Stroke {
+                style: Style::Solid(cfg().color_border_dimmed.to_iced()),
                 width: 1.0,
                 ..Default::default()
             };
@@ -370,22 +471,23 @@ impl<Message> canvas::Program<Message> for Rowlink {
                 let sub_w = sub_container_w / cfg().sub_cols as f32;
                 let sub_h = sub_container_h / cfg().sub_rows as f32;
 
-                // --- Dynamic Drawing Loop ---
-                // We iterate safely through the configured strings
                 for (r_idx, row_str) in cfg().sub_labels.iter().enumerate() {
-                    if r_idx >= cfg().sub_rows as usize { break; } // Safety check
+                    if r_idx >= cfg().sub_rows as usize {
+                        break;
+                    }
 
                     for (c_idx, label_char) in row_str.chars().enumerate() {
-                        if c_idx >= cfg().sub_cols as usize { break; } // Safety check
+                        if c_idx >= cfg().sub_cols as usize {
+                            break;
+                        }
 
                         let x = main_x + cfg().sub_padding + (c_idx as f32 * sub_w);
                         let y = main_y + cfg().sub_padding + (r_idx as f32 * sub_h);
 
-                        // Highlight 2nd row (index 1) as Home Row
-                        let text_color = if r_idx == 1 { 
-                            cfg().color_sub_home_row.to_iced() 
-                        } else { 
-                            cfg().color_sub_default.to_iced() 
+                        let text_color = if r_idx == 1 {
+                            cfg().color_sub_home_row.to_iced()
+                        } else {
+                            cfg().color_sub_default.to_iced()
                         };
 
                         frame.fill_text(Text {
@@ -401,18 +503,49 @@ impl<Message> canvas::Program<Message> for Rowlink {
                     }
                 }
             } else {
+                let active_row = if self.input_buffer.len() == 1 {
+                    let c = self.input_buffer.chars().next().unwrap();
+                    Some((c as u32 - BASE_CHAR) as i32)
+                } else {
+                    None
+                };
+
                 for r in 0..cfg().main_grid_size as i32 {
+                    let is_active_row = Some(r) == active_row;
+                    let is_dimmed_mode = active_row.is_some();
+
+                    let (current_stroke, current_text_color) = if !is_dimmed_mode || is_active_row {
+                        (stroke_normal.clone(), cfg().color_main_text.to_iced())
+                    } else {
+                        (stroke_dimmed.clone(), cfg().color_text_dimmed.to_iced())
+                    };
+
+                    if is_active_row {
+                        frame.fill_rectangle(
+                            Point::new(0.0, r as f32 * cell_height),
+                            iced::Size::new(bounds.width, cell_height),
+                            cfg().color_row_highlight.to_iced(),
+                        );
+                    }
+
                     for c in 0..cfg().main_grid_size as i32 {
                         let x = c as f32 * cell_width;
                         let y = r as f32 * cell_height;
                         frame.stroke(
-                            &iced::widget::canvas::Path::rectangle(Point::new(x, y), iced::Size::new(cell_width, cell_height)),
-                            border_stroke.clone(),
+                            &iced::widget::canvas::Path::rectangle(
+                                Point::new(x, y),
+                                iced::Size::new(cell_width, cell_height),
+                            ),
+                            current_stroke.clone(),
                         );
                         frame.fill_text(Text {
-                            content: format!("{}{}", (BASE_BYTE + r as u8) as char, (BASE_BYTE + c as u8) as char),
+                            content: format!(
+                                "{}{}",
+                                (BASE_BYTE + r as u8) as char,
+                                (BASE_BYTE + c as u8) as char
+                            ),
                             position: Point::new(x + cell_width / HALF, y + cell_height / HALF),
-                            color: cfg().color_main_text.to_iced(),
+                            color: current_text_color,
                             size: cfg().font_size.into(),
                             align_x: iced::widget::text::Alignment::Center,
                             align_y: iced::alignment::Vertical::Center,
