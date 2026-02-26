@@ -246,6 +246,8 @@ fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
                 keyboard::Key::Named(keyboard::key::Named::Escape) => {
                     state.visible = false;
                     state.input_buffer.clear();
+                    state.zoomed_cell = None;
+                    state.grid_cache.clear();
                     let (new_id, spawn_task) = Message::layershell_open(get_layer_settings(false));
                     let old_id = state.current_id.replace(new_id).unwrap();
                     iced::Task::batch(vec![iced::Task::done(Message::RemoveWindow(old_id)), spawn_task])
