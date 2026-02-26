@@ -1,9 +1,10 @@
-use enigo::{Button, Coordinate, Direction, Enigo, Mouse, Settings as EnigoSettings};
+use enigo::{Button, Coordinate, Direction, Enigo, InputResult, Mouse, Settings as EnigoSettings};
 use iced::futures::sink::SinkExt;
-use iced::keyboard;
-use iced::stream;
 use iced::widget::canvas::{self, Canvas, Style, Text};
-use iced::{Color, Element, Event, Fill, Font, Point, Rectangle, Renderer, Subscription, Theme};
+use iced::{
+    Color, Element, Event, Fill, Font, Point, Rectangle, Renderer, Subscription, Theme, keyboard,
+    stream,
+};
 use iced_layershell::actions::ActionCallback;
 use iced_layershell::reexport::{
     Anchor, IcedId, KeyboardInteractivity, Layer, NewLayerShellSettings,
@@ -49,6 +50,9 @@ struct AppConfig {
     delay_wayland_zero_ms: u64,
     delay_wayland_move_ms: u64,
     delay_double_click_ms: u64,
+    scroll_lines: i32,
+    scroll_page_lines: i32,
+    scroll_natural: bool,
     // Colors
     color_grid_border: ConfigColor,
     color_main_text: ConfigColor,
@@ -59,6 +63,48 @@ struct AppConfig {
     color_border_dimmed: ConfigColor,
     // Labels (Dynamic 2D Grid)
     sub_labels: Vec<String>,
+}
+
+impl AppConfig {
+    fn get_main_cell_size(&self, width: f32, height: f32) -> (f32, f32) {
+        (
+            width / self.main_grid_size,
+            height / self.main_grid_size,
+        )
+    }
+
+    fn get_main_cell_center(&self, width: f32, height: f32, row: i32, col: i32) -> (f32, f32) {
+        let (w, h) = self.get_main_cell_size(width, height);
+        (
+            (col as f32 * w) + (w / HALF),
+            (row as f32 * h) + (h / HALF),
+        )
+    }
+
+    fn get_precision_target(
+        &self,
+        width: f32,
+        height: f32,
+        main_row: i32,
+        main_col: i32,
+        sub_row: i32,
+        sub_col: i32,
+    ) -> (f32, f32) {
+        let (cell_w, cell_h) = self.get_main_cell_size(width, height);
+        let main_x = main_col as f32 * cell_w;
+        let main_y = main_row as f32 * cell_h;
+
+        let sub_container_w = cell_w - (self.sub_padding * DOUBLE);
+        let sub_container_h = cell_h - (self.sub_padding * DOUBLE);
+
+        let sub_w = sub_container_w / self.sub_cols as f32;
+        let sub_h = sub_container_h / self.sub_rows as f32;
+
+        let target_x = main_x + self.sub_padding + (sub_col as f32 * sub_w) + (sub_w / HALF);
+        let target_y = main_y + self.sub_padding + (sub_row as f32 * sub_h) + (sub_h / HALF);
+
+        (target_x, target_y)
+    }
 }
 
 impl Default for AppConfig {
@@ -75,6 +121,9 @@ impl Default for AppConfig {
             delay_wayland_zero_ms: 5,
             delay_wayland_move_ms: 20,
             delay_double_click_ms: 120,
+            scroll_lines: 1,
+            scroll_page_lines: 10,
+            scroll_natural: true,
             color_grid_border: ConfigColor {
                 r: 1.0,
                 g: 1.0,
@@ -137,13 +186,12 @@ const BASE_BYTE: u8 = b'A';
 fn load_config() -> AppConfig {
     if let Some(proj_dirs) = directories::ProjectDirs::from("com", "rowlink", "rowlink") {
         let config_path = proj_dirs.config_dir().join("config.yaml");
-        if config_path.exists() {
-            if let Ok(file) = std::fs::File::open(config_path) {
-                if let Ok(cfg) = serde_yaml::from_reader(file) {
-                    println!("Loaded config from file.");
-                    return cfg;
-                }
-            }
+        if config_path.exists()
+            && let Ok(file) = std::fs::File::open(config_path)
+            && let Ok(cfg) = serde_yaml::from_reader(file)
+        {
+            println!("Loaded config from file.");
+            return cfg;
         }
     }
     println!("Using default config.");
@@ -180,20 +228,47 @@ fn namespace() -> String {
 
 struct Rowlink {
     input_buffer: String,
+    enigo: Option<Enigo>,
     visible: bool,
     grid_cache: canvas::Cache,
     current_id: Option<IcedId>,
     zoomed_cell: Option<(i32, i32)>,
+    last_mouse_pos: Option<(f32, f32)>,
+}
+
+impl Rowlink {
+    fn perform_enigo_action<F>(&mut self, mut action: F)
+    where
+        F: FnMut(&mut Enigo) -> InputResult<()>,
+    {
+        if self.enigo.is_none() {
+            self.enigo = Enigo::new(&EnigoSettings::default()).ok();
+        }
+
+        if let Some(enigo) = self.enigo.as_mut()
+            && let Err(e) = action(enigo)
+        {
+            eprintln!("Enigo Error (will retry): {:?}", e);
+
+            self.enigo = Enigo::new(&EnigoSettings::default()).ok();
+
+            if let Some(enigo_retry) = self.enigo.as_mut() {
+                let _ = action(enigo_retry);
+            }
+        }
+    }
 }
 
 impl Default for Rowlink {
     fn default() -> Self {
         Self {
             input_buffer: String::new(),
+            enigo: Some(Enigo::new(&EnigoSettings::default()).expect("Enigo init failed")),
             visible: false,
             grid_cache: canvas::Cache::default(),
             current_id: None,
             zoomed_cell: None,
+            last_mouse_pos: None,
         }
     }
 }
@@ -205,6 +280,7 @@ enum Message {
     SignalReceived,
     ExecuteMovePrecision(i32, i32, i32, i32, bool),
     ExecuteMoveCenter(Option<(i32, i32)>, bool),
+    ExecuteScroll(Option<(i32, i32)>, i32, i32),
     IcedEvent(Event),
 }
 
@@ -243,38 +319,70 @@ fn map_key_to_subgrid(c: char) -> Option<(i32, i32)> {
     None
 }
 
-fn perform_wayland_click(x: f32, y: f32, is_double: bool) {
-    let mut enigo = match Enigo::new(&EnigoSettings::default()) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("Rowlink Error: Could not connect to input system: {}", e);
-            return;
-        }
-    };
-
+fn move_sequence(enigo: &mut Enigo, x: f32, y: f32) -> InputResult<()> {
     std::thread::sleep(std::time::Duration::from_millis(
         cfg().delay_surface_destroy_ms,
     ));
-    let _ = enigo.move_mouse(-10000, -10000, Coordinate::Rel);
+    enigo.move_mouse(-10000, -10000, Coordinate::Rel)?;
     std::thread::sleep(std::time::Duration::from_millis(
         cfg().delay_wayland_zero_ms,
     ));
-    let _ = enigo.move_mouse(x.round() as i32, y.round() as i32, Coordinate::Rel);
+    enigo.move_mouse(x.round() as i32, y.round() as i32, Coordinate::Rel)?;
     std::thread::sleep(std::time::Duration::from_millis(
         cfg().delay_wayland_move_ms,
     ));
+    Ok(())
+}
 
-    let _ = enigo.button(Button::Left, Direction::Click);
+fn click_sequence(
+    enigo: &mut Enigo,
+    x: f32,
+    y: f32,
+    is_double: bool,
+    same_pos: bool,
+) -> InputResult<()> {
+    if !same_pos {
+        move_sequence(enigo, x, y)?;
+    }
+
+    enigo.button(Button::Left, Direction::Click)?;
     if is_double {
         std::thread::sleep(std::time::Duration::from_millis(
             cfg().delay_double_click_ms,
         ));
-        let _ = enigo.button(Button::Left, Direction::Click);
+        enigo.button(Button::Left, Direction::Click)?;
     }
+    Ok(())
+}
+
+fn scroll_sequence(
+    enigo: &mut Enigo,
+    x: f32,
+    y: f32,
+    dx: i32,
+    dy: i32,
+    same_pos: bool,
+) -> InputResult<()> {
+    if !same_pos {
+        move_sequence(enigo, x, y)?;
+    }
+
+    let (final_dx, final_dy) = if cfg().scroll_natural {
+        (-dx, -dy)
+    } else {
+        (dx, dy)
+    };
+
+    if final_dx != 0 {
+        enigo.scroll(final_dx, enigo::Axis::Horizontal)?;
+    }
+    if final_dy != 0 {
+        enigo.scroll(final_dy, enigo::Axis::Vertical)?;
+    }
+    Ok(())
 }
 
 // --- Subscription & Update ---
-
 fn signal_worker() -> impl iced::futures::Stream<Item = Message> {
     stream::channel(10, async |mut output| {
         let mut sig = signal(SignalKind::user_defined1()).expect("Failed to setup signal listener");
@@ -305,6 +413,7 @@ fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
         Message::SignalReceived => {
             state.visible = true;
             state.input_buffer.clear();
+            state.last_mouse_pos = None;
             let (new_id, spawn_task) = Message::layershell_open(get_layer_settings(true));
             let old_id = state.current_id.replace(new_id).unwrap_or(IcedId::unique());
             iced::Task::batch(vec![
@@ -356,12 +465,33 @@ fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
                     ])
                 }
                 keyboard::Key::Character(c) => {
+                    if state.zoomed_cell.is_some() && modifiers.control() {
+                        let step = cfg().scroll_lines;
+                        let page_step = cfg().scroll_page_lines;
+
+                        let (dx, dy) = match c.as_str() {
+                            "j" => (0, -step),      // Down (Negative Y in Enigo usually implies down)
+                            "k" => (0, step),       // Up
+                            "h" => (-step, 0),      // Left
+                            "l" => (step, 0),       // Right
+                            "d" => (0, -page_step), // Page Down
+                            "u" => (0, page_step),  // Page Up
+                            _ => (0, 0),
+                        };
+
+                        if dx != 0 || dy != 0 {
+                            return iced::Task::done(Message::ExecuteScroll(
+                                state.zoomed_cell,
+                                dx,
+                                dy,
+                            ));
+                        }
+                    }
                     let c_char = c.chars().next().unwrap();
                     if state.zoomed_cell.is_none() {
                         let c_upper = c_char.to_ascii_uppercase();
                         if c_upper.is_ascii_uppercase() {
                             state.input_buffer.push(c_upper);
-                            // Clear cache to trigger redraw for row highlight
                             state.grid_cache.clear();
                         }
                         if state.input_buffer.len() >= 2 {
@@ -418,32 +548,47 @@ fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
             }
         }
         Message::ExecuteMovePrecision(main_row, main_col, sub_row, sub_col, is_double) => {
-            let cell_w = cfg().screen_width / cfg().main_grid_size;
-            let cell_h = cfg().screen_height / cfg().main_grid_size;
-            let main_x = main_col as f32 * cell_w;
-            let main_y = main_row as f32 * cell_h;
-            let sub_container_w = cell_w - (cfg().sub_padding * DOUBLE);
-            let sub_container_h = cell_h - (cfg().sub_padding * DOUBLE);
-            let sub_w = sub_container_w / cfg().sub_cols as f32;
-            let sub_h = sub_container_h / cfg().sub_rows as f32;
-            let target_x = main_x + cfg().sub_padding + (sub_col as f32 * sub_w) + (sub_w / HALF);
-            let target_y = main_y + cfg().sub_padding + (sub_row as f32 * sub_h) + (sub_h / HALF);
-            perform_wayland_click(target_x, target_y, is_double);
+            let (target_x, target_y) = cfg().get_precision_target(
+                cfg().screen_width,
+                cfg().screen_height,
+                main_row,
+                main_col,
+                sub_row,
+                sub_col,
+            );
+            let same_pos = state.last_mouse_pos == Some((target_x, target_y));
+            state.perform_enigo_action(|enigo| {
+                click_sequence(enigo, target_x, target_y, is_double, same_pos)
+            });
+            state.last_mouse_pos = Some((target_x, target_y));
             iced::Task::none()
         }
         Message::ExecuteMoveCenter(target_cell, is_double) => {
             let (target_x, target_y) = match target_cell {
                 Some((r, c)) => {
-                    let cell_w = cfg().screen_width / cfg().main_grid_size;
-                    let cell_h = cfg().screen_height / cfg().main_grid_size;
-                    (
-                        (c as f32 * cell_w) + (cell_w / HALF),
-                        (r as f32 * cell_h) + (cell_h / HALF),
-                    )
+                    cfg().get_main_cell_center(cfg().screen_width, cfg().screen_height, r, c)
                 }
                 None => (cfg().screen_width / HALF, cfg().screen_height / HALF),
             };
-            perform_wayland_click(target_x, target_y, is_double);
+            let same_pos = state.last_mouse_pos == Some((target_x, target_y));
+            state.perform_enigo_action(|enigo| {
+                click_sequence(enigo, target_x, target_y, is_double, same_pos)
+            });
+            state.last_mouse_pos = Some((target_x, target_y));
+            iced::Task::none()
+        }
+        Message::ExecuteScroll(target_cell, dx, dy) => {
+            let (target_x, target_y) = match target_cell {
+                Some((r, c)) => {
+                    cfg().get_main_cell_center(cfg().screen_width, cfg().screen_height, r, c)
+                }
+                None => (cfg().screen_width / HALF, cfg().screen_height / HALF),
+            };
+            let same_pos = state.last_mouse_pos == Some((target_x, target_y));
+            state.perform_enigo_action(|enigo| {
+                scroll_sequence(enigo, target_x, target_y, dx, dy, same_pos)
+            });
+            state.last_mouse_pos = Some((target_x, target_y));
             iced::Task::none()
         }
         _ => iced::Task::none(),
@@ -452,7 +597,7 @@ fn update(state: &mut Rowlink, message: Message) -> iced::Task<Message> {
 
 // --- View & Style ---
 
-fn view(state: &Rowlink) -> Element<Message> {
+fn view(state: &'_ Rowlink) -> Element<'_, Message> {
     if !state.visible {
         return iced::widget::container(iced::widget::space()).into();
     }
@@ -480,8 +625,8 @@ impl<Message> canvas::Program<Message> for Rowlink {
         _cursor: iced::mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let grid = self.grid_cache.draw(renderer, bounds.size(), |frame| {
-            let cell_width = bounds.width / cfg().main_grid_size;
-            let cell_height = bounds.height / cfg().main_grid_size;
+            let (cell_width, cell_height) =
+                cfg().get_main_cell_size(bounds.width, bounds.height);
             let stroke_normal = canvas::Stroke {
                 style: Style::Solid(cfg().color_grid_border.to_iced()),
                 width: 1.0,
@@ -495,13 +640,6 @@ impl<Message> canvas::Program<Message> for Rowlink {
             };
 
             if let Some((zoom_r, zoom_c)) = self.zoomed_cell {
-                let main_x = zoom_c as f32 * cell_width;
-                let main_y = zoom_r as f32 * cell_height;
-                let sub_container_w = cell_width - (cfg().sub_padding * DOUBLE);
-                let sub_container_h = cell_height - (cfg().sub_padding * DOUBLE);
-                let sub_w = sub_container_w / cfg().sub_cols as f32;
-                let sub_h = sub_container_h / cfg().sub_rows as f32;
-
                 for (r_idx, row_str) in cfg().sub_labels.iter().enumerate() {
                     if r_idx >= cfg().sub_rows as usize {
                         break;
@@ -512,8 +650,14 @@ impl<Message> canvas::Program<Message> for Rowlink {
                             break;
                         }
 
-                        let x = main_x + cfg().sub_padding + (c_idx as f32 * sub_w);
-                        let y = main_y + cfg().sub_padding + (r_idx as f32 * sub_h);
+                        let (target_x, target_y) = cfg().get_precision_target(
+                            bounds.width,
+                            bounds.height,
+                            zoom_r,
+                            zoom_c,
+                            r_idx as i32,
+                            c_idx as i32,
+                        );
 
                         let text_color = if r_idx == 1 {
                             cfg().color_sub_home_row.to_iced()
@@ -523,7 +667,7 @@ impl<Message> canvas::Program<Message> for Rowlink {
 
                         frame.fill_text(Text {
                             content: label_char.to_string(),
-                            position: Point::new(x + sub_w / HALF, y + sub_h / HALF),
+                            position: Point::new(target_x, target_y),
                             color: text_color,
                             size: cfg().font_size.into(),
                             align_x: iced::widget::text::Alignment::Center,
@@ -546,9 +690,9 @@ impl<Message> canvas::Program<Message> for Rowlink {
                     let is_dimmed_mode = active_row.is_some();
 
                     let (current_stroke, current_text_color) = if !is_dimmed_mode || is_active_row {
-                        (stroke_normal.clone(), cfg().color_main_text.to_iced())
+                        (stroke_normal, cfg().color_main_text.to_iced())
                     } else {
-                        (stroke_dimmed.clone(), cfg().color_text_dimmed.to_iced())
+                        (stroke_dimmed, cfg().color_text_dimmed.to_iced())
                     };
 
                     if is_active_row {
@@ -562,12 +706,14 @@ impl<Message> canvas::Program<Message> for Rowlink {
                     for c in 0..cfg().main_grid_size as i32 {
                         let x = c as f32 * cell_width;
                         let y = r as f32 * cell_height;
+                        let (center_x, center_y) =
+                            cfg().get_main_cell_center(bounds.width, bounds.height, r, c);
                         frame.stroke(
                             &iced::widget::canvas::Path::rectangle(
                                 Point::new(x, y),
                                 iced::Size::new(cell_width, cell_height),
                             ),
-                            current_stroke.clone(),
+                            current_stroke,
                         );
                         frame.fill_text(Text {
                             content: format!(
@@ -575,7 +721,7 @@ impl<Message> canvas::Program<Message> for Rowlink {
                                 (BASE_BYTE + r as u8) as char,
                                 (BASE_BYTE + c as u8) as char
                             ),
-                            position: Point::new(x + cell_width / HALF, y + cell_height / HALF),
+                            position: Point::new(center_x, center_y),
                             color: current_text_color,
                             size: cfg().font_size.into(),
                             align_x: iced::widget::text::Alignment::Center,
